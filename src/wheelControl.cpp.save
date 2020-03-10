@@ -1,0 +1,317 @@
+/* 
+
+This is the ROS control node for the rover's wheels, written in c++. This node takes input from the encoders node and 
+front end node (joystick), does some PID control (if the motor encoders aren't boken), then sends a command to the 
+sabertooths. Written by Alex White so if theres a problem with it talk to me.
+
+*/
+
+#include <iostream>
+#include "ros/ros.h"
+#include "wheel_control/wheelSpeed.h"
+#include "sensor_msgs/JointState.h"
+#include "sabertooth/sabertooth.h"
+#include "phidgets_high_speed_encoder/EncoderDecimatedSpeed.h"
+#include <std_msgs/Float64.h>
+#include <math.h>
+#include <functional>
+
+using namespace std;
+
+/*--------------------Variable Defenitions--------------------*/
+
+// Set points are taken in from the outsde world and used to set target speeds for the control
+float setPoints[2] = {0, 0};
+/*
+	0 --> Left
+	1 --> Right
+*/
+
+// We've got different control modes for the wheels
+int wheelMode = 0;
+/*
+	0 --> normal PID control 
+	1 --> step 
+	2 --> traction control (traction control currently doesn't work, we have plans to fix it)
+	3 --> straight voltage control ie. motor encoders are fucked 
+*/
+
+// The range that is written to the sabertooth is 0 to 127 where 0 is full backwards, 64 is stopped, 127 is full forward.
+uint16_t motorSpeed[4] = {64, 64, 64, 64};
+/*
+	0 --> Front Left
+	1 --> Front Right
+	2 --> Back Left
+	3 --> Back Right
+*/
+
+// Read the sabertooth documentation if you want to understand this
+uint16_t motorAddress[][2] = {{128, 7},{128, 6},{130, 7},{130,6}};
+/*
+	0 --> Front Left
+	1 --> Front Right
+	2 --> Back Left
+	3 --> Back Right
+*/
+
+float encoderValues[4]; 
+/*
+	0 --> Front Left 
+	1 --> Front Right 
+	2 --> Back Right 
+	3 --> Back Left 
+*/
+
+const float stopCommand = 64.0;
+
+// Control gains
+float kp = 0;
+float ki = 0;
+float kd = 0;
+//ALEX's special numbers: p:22 i:0.2 d:0.3
+// Variables used in normalControl(). Declared here so that they don't get redeclared everytime the function runs.
+
+float sp; //motor setpoint
+float error;
+float encSpeed;
+float throttleVal;
+int motorVal;
+int maxSpeed = 127;
+int minSpeed = 0;
+// these are arrays so one value is stored for each wheel 
+float cumError[4]; 
+float lastError[4]; 
+float derError[4]; 
+
+/*--------------------Function Defenitions--------------------*/
+
+//This function is called by ros::spin() and ros::spinOnce() in main() and is how we handle incoming messages.
+void wheelCallBack(const wheel_control::wheelSpeed msg) {
+
+	ROS_INFO("I heard: Left: [%f], Right: [%f].\n", msg.left, msg.right);
+	setPoints[0] = msg.left;//*(float)maxSpeed;
+	setPoints[1] = msg.right;//*(float)maxSpeed;
+	wheelMode = msg.wheelMode;
+}//end wheelCallBack
+
+void encoderCallBack(const sensor_msgs::JointState msg) {
+
+//TODO: This should use the names as defined by the name parameter, rather than these magic numbers. This could happen once at the begining for speed it needed
+	encoderValues[0] = -msg.velocity[0];
+	encoderValues[1] = msg.velocity[1];
+	encoderValues[2] = msg.velocity[3];
+	encoderValues[3] = -msg.velocity[2];
+
+	ROS_INFO("Got encoder values: FL: [%f], FR: [%f].\n", encoderValues[0], encoderValues[1]);
+}//end encoderCallBack
+
+//TODO: This is super hacks and not the right way to do this.
+void decimatedEncoderCallback_0(const phidgets_high_speed_encoder::EncoderDecimatedSpeed msg){
+	encoderValues[0] = msg.avr_speed;
+}
+
+void decimatedEncoderCallback_1(const phidgets_high_speed_encoder::EncoderDecimatedSpeed msg){
+	encoderValues[1] = -msg.avr_speed;
+}
+
+void decimatedEncoderCallback_2(const phidgets_high_speed_encoder::EncoderDecimatedSpeed msg){
+	encoderValues[2] = msg.avr_speed;
+}
+
+void decimatedEncoderCallback_3(const phidgets_high_speed_encoder::EncoderDecimatedSpeed msg){
+	encoderValues[3] = -msg.avr_speed;
+}
+
+void AndrewControl(){
+	for(int n= 0; n<4;n++){
+		sp = 0.0;
+		error = 0.0;
+		encSpeed = 0;
+		motorVal = 0;
+		throttleVal = 0;
+		
+		if(n ==0 ||n == 2){
+			sp = setPoints[0]*maxSpeed;
+		}else{
+			sp = setPoints[1]*maxSpeed;
+		}
+		
+		encSpeed = encoderValues[n];
+		//calculate relative error
+		error = sp - encSpeed;
+		
+		cumError[n] +=error;
+		//derError[n] = (error - lastError[n]);
+		if(cumError[n]*error<0){
+			cumError[n] = 0;
+		}
+		cout<<"Error:"<<error<<endl;
+		throttleVal = kp*error+ki*cumError[n];
+		motorVal =throttleVal;	
+		motorVal = motorSpeed[n] + motorVal; 
+		motorSpeed[n] = motorVal;
+		lastError[n] = error;
+	}	
+
+}
+
+// This function tries its darndest to match the setpoint speed on each wheel, its basically a P controller that 
+// adjusts a throttle postion after each loop. Basically shitty cruise cotnrol. It kinda comes out to be a PI 
+// controller, we dont need no D, we got dirt for that.
+void normalControl() {
+	// the actual wheel control system that is called from the control loop 
+	// loop over wheel motors to get speeds 
+    
+	for(int n=0; n<4;n++) {
+		// get setpoint in terms of encoder speed
+		sp = 0.0; 
+		error = 0; 
+		encSpeed = 0; 
+		motorVal = 0;
+		throttleVal = 0;
+
+		// SP will then be a value from -MaxWheelSpeed to Plus Max Wheel Speed
+		if(n == 0)
+			sp = setPoints[0]*350;
+		else if (n == 1)
+			sp = setPoints[1]*350;
+		else if (n == 2)
+			sp = setPoints[0]*350;
+		else if (n == 3)
+			sp = setPoints[1]*350;
+
+		// get encoder speed
+		encSpeed = encoderValues[n]; // this value should have the same range OR MORE than the SP range 
+		// if the range of EncSpeed is less than the range of SP, as when you have a large Max wheel Speed this means the system saturates quickly 
+		//cout << "Encoder: "<<n<< " Value is: "<< EncSpeed<< " From Control Loop"<<endl; 
+		//Find the difference between the setpoint and where the encoders are 
+		error = sp - encSpeed; 
+		cout<<"SetPoint " <<n<<": " << sp<<endl;
+		cout<<"Enc " <<n<<": " << encSpeed<<endl;
+		cout<<"Error "<<n<<": "<< error<<endl;
+		cumError[n] += error; // update the cum error 
+		derError[n] = (error - lastError[n]); // update the der error 
+		if(cumError[n]*error <0){
+			/// this means we had a zero crossing and we should zero the CumError and the Last Error 
+			// a zero crossing is the sign of the error changed 
+			cumError[n] = 0.0;
+			derError[n] = 0.0;
+			// in proper this does not need to be done, but it was added to try to improve settling time, normally you would have to have a large 
+			/// overshoot to kill the cum error 
+		}
+		// set a throttle value based on the gains and the errors 
+		// everything should be kept as a flot going in, and then when we modify the motor vals it becomes and int 
+		throttleVal = kp * error + ki * cumError[n] + kd * derError[n]; 
+		//apply the throttle change to the Motor val
+		// the throttle value is used to move the motor speed (voltage applied) from the pervious loop into the present 
+		// MOTOR VAL HAS TO BE AN INT. The motor controllers can only take in ints as a motor speed value 
+		if(n<2){
+			// this motor is the back right motor, it is backwards becasues reasons 
+			motorVal = motorSpeed[n] - round(throttleVal);
+		}else{
+			motorVal = motorSpeed[n] + round(throttleVal);
+		}
+		// bound the motor speed
+		// the purpose of this was to not give the motor controller a value outside of the expected range. This acts as a forced saturation on the motor controller in code 
+		// the motor controller should also do this itself, but this was done by the Departmant of Reduandacy Department to be redundant. 
+		if(motorVal>maxSpeed){
+			motorVal = maxSpeed;
+		}else if(motorVal<minSpeed){
+			motorVal = minSpeed;
+		}
+		if(motorVal > 90) motorVal = 90;
+		if(motorVal < 40) motorVal = 40;
+		//if(setPoint == 0) motorVal = 64;
+		// re assign the motor speed
+		motorSpeed[n] = motorVal; // after its been bounded we write this to the valeu taht we are going to write
+//		cout<<"Writing Motor Send: "<<MotorVal<<" EncoderValue: "<<EncSpeed<<" Index: "<< n<<" Error: "<< Error << " ThrottleVal:"<<ThrottleVal << " SetPoint:"<< SP <<endl;
+		lastError[n] = error;
+	}
+	// loop over wheels to write
+	// these were done seperatly to redunce the delay in writing to all the motors incase of large change so we dont have weird jerks 
+}
+
+void stepControl() {
+
+}//end stepControl
+
+
+void tractionControl() {
+
+}//end tractionControl
+
+//This is used if all the encoders are fucked
+void voltageControl() {
+	motorSpeed[0] = -setPoints[0]*63.0 + stopCommand;
+	motorSpeed[1] = -setPoints[1]*63.0 + stopCommand;
+	motorSpeed[2] = setPoints[0]*63.0 + stopCommand;
+	motorSpeed[3] = setPoints[1]*63.0 + stopCommand;
+}//end voltageControl
+
+void eStop() {
+	for(int i; i<4; i++)
+		motorSpeed[i] = stopCommand; 
+}//end eStop
+
+int main(int argc, char **argv) {
+
+	//set up the ROS node
+	ros::init(argc, argv, "wheelControl");
+	ros::NodeHandle n;
+	ros::Subscriber joystickSub = n.subscribe("wheelSpeedTopic", 1000, wheelCallBack);
+	//ros::Subscriber encoderSub = n.subscribe("joint_states", 1000, encoderCallBack);
+	ros::Publisher pub = n.advertise<sabertooth::sabertooth>("sabertoothTopic", 1000);
+	
+	ros::Publisher setpointLeft = n.advertise<std_msgs::Float64>("setpointLeft", 100);
+	ros::Publisher setpointRight = n.advertise<std_msgs::Float64>("setpointRight", 100);
+	
+	ros::Subscriber enc0 = n.subscribe("joint_states_ch0_decim_speed", 1, decimatedEncoderCallback_0);
+	ros::Subscriber enc1 = n.subscribe("joint_states_ch1_decim_speed", 1, decimatedEncoderCallback_1);
+	ros::Subscriber enc2 = n.subscribe("joint_states_ch2_decim_speed", 1, decimatedEncoderCallback_3);
+	ros::Subscriber enc3 = n.subscribe("joint_states_ch3_decim_speed", 1, decimatedEncoderCallback_2);
+
+
+	ros::Rate loop_rate(10);
+
+	cout << "Control node ready." << endl;
+	cout<< "This built to this"<<endl;
+
+	//the whole node loops on this while loop
+	while (ros::ok()) {
+		if (wheelMode == 0){
+			//std_msgs::Float64 left;
+			//std_msgs::Float64 right;
+			//left.data = setPoints[0];
+			//right.data = setPoints[1];
+
+			//setpointLeft.publish(left);
+			//setpointRight.publish(right);
+			normalControl();
+			//AndrewControl();
+		}
+		else if (wheelMode == 1)
+			stepControl();
+		else if (wheelMode == 2)
+			tractionControl();
+		else if (wheelMode == 3)
+			voltageControl();
+		else
+			eStop();
+
+		//sending the sabertooth message
+		sabertooth::sabertooth msg;
+
+		for(int i=0; i<1; i++) {
+			msg.data = motorSpeed[i];
+			msg.address = motorAddress[i][0];
+			msg.command = motorAddress[i][1];
+			ROS_INFO("Sending Speed [%d] to motor [%d].\n", motorSpeed[i], i);
+			pub.publish(msg);
+		}
+		ros::spinOnce();
+		loop_rate.sleep();
+	}
+
+	return 0;
+
+}//end main

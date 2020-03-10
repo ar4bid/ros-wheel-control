@@ -1,0 +1,64 @@
+variables:
+  PACKAGE: "wheel_control"
+  ROS_DISTRO: "kinetic"
+  CI_SOURCE_PATH: "$CI_PROJECT_DIR"
+  WS_DIR: "${CI_PROJECT_NAME}_ws"
+
+before_script:
+# before install - yes! Finally!
+  - shopt -s extglob
+  - source /opt/ros/$ROS_DISTRO/setup.bash
+  - mkdir -p $WS_DIR/src/$PACKAGE
+  - cd $WS_DIR
+  - git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/qset_rover/ros_sabertooth.git src/sabertooth
+  - git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/qset_rover/phidgets_drivers.git src/phidgets
+  - catkin init
+  - catkin build --no-status
+  - cd $CI_PROJECT_DIR
+  - mv !($WS_DIR) $WS_DIR/src/$PACKAGE/
+  - cd $WS_DIR
+  - source devel/setup.bash
+
+  #This is if you configure your rosdep correctly
+  - rosdep update
+  #- rosdep install -y --from-paths src --ignore-src --rosdistro $ROS_DISTRO
+
+#No Clean up needed in this version
+#after_script:
+#  - cd ~
+#  - rm -r ./catkin_ws
+#  - if [ -e $CI_PROJECT_NAME ]; then rm $CI_PROJECT_NAME; else echo "project does not exist";fi
+
+stages:
+  - build
+  - test
+  - lint
+
+build:
+  stage: build
+  script:
+    - catkin build --no-status --verbose
+    
+  tags:
+    - QSET
+    - ROS
+    - ARM
+
+catkin tests:
+  stage: test
+  tags:
+    - QSET
+    - ROS
+    - ARM
+  script: 
+    - catkin run_tests
+    - catkin_test_results build --verbose
+
+catkin lint:
+  stage: lint
+  tags:
+    - QSET
+    - ARM
+    - ROS
+  script:
+    - catkin lint --explain -W2 --strict ./src/$PACKAGE --ignore env_var --ignore link_directory --ignore missing_install_target
